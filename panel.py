@@ -8,18 +8,117 @@ Kullanım:
 """
 import argparse
 import ctypes
+import math
 import queue
+import re
 import threading
 import time
 import tkinter as tk
+import unicodedata
 
 import serial
 import serial.tools.list_ports
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 SHOW_SECONDS = 5
 FLUSH_AFTER = 0.6  # satır sonu gelmezse bu kadar sn sonra mesajı göster
+MAX_VISIBLE = 5    # ekranda aynı anda en fazla bu kadar balon durur
+FADE_IN = 0.25
+FADE_OUT = 0.40
+MAX_ALPHA = 0.95
+GAP = 10           # balonlar arası boşluk (96 dpi pikseli)
+TOP = 110          # ilk balonun ekranın üstünden uzaklığı
+TEXT_PT = 13
+MAX_TEXT_W = 320
+
+BUBBLE_FILL = "#fff3d6"
+BUBBLE_EDGE = "#d9b779"
+TEXT_RGB = (0x3b, 0x2a, 0x1a)
+KEY = "#010101"    # bu renk tamamen şeffaf olur
+
+FONT_TEXT = r"C:\Windows\Fonts\segoeuib.ttf"
+FONT_EMOJI = r"C:\Windows\Fonts\seguiemj.ttf"
+
+ENCODING = "auto"  # auto: önce UTF-8, olmazsa Windows-1254 (Türkçe)
 
 messages = queue.Queue()
+
+
+def decode(raw):
+    """Telefondan gelen baytları metne çevir (UTF-8 ya da Türkçe Windows-1254)."""
+    if ENCODING == "auto":
+        try:
+            s = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            s = raw.decode("cp1254", "replace")
+    else:
+        s = raw.decode(ENCODING, "replace")
+    # i + birleşik nokta gibi ayrık yazılmış ç ğ ı İ ö ş ü harflerini tek karaktere çevir
+    s = unicodedata.normalize("NFC", s)
+    s = "".join(" " if c == "\t" else c for c in s
+                if c == "\t" or (unicodedata.category(c) not in ("Cc", "Cs") and c != "\ufeff"))
+    return s.strip()
+
+
+EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B50\u2B55\u2B1B\u2B1C"
+                      "\u231A\u231B\u23E9-\u23F3]")
+EMOJI_JUNK = re.compile("[\uFE0F\u200D\u20E3\U0001F3FB-\U0001F3FF]")  # varyasyon/ton/birleştirici
+
+
+def make_fonts(px):
+    def load(path):
+        try:
+            return ImageFont.truetype(path, px)
+        except OSError:
+            return ImageFont.truetype("arial.ttf", px)
+    text = load(FONT_TEXT)
+    return text, load(FONT_EMOJI)
+
+
+def render_text(text, fonts, max_w):
+    """Metni (renkli emojiler dahil) saydam bir resme çiz."""
+    font, efont = fonts
+    text = EMOJI_JUNK.sub("", " ".join(text.split()))
+    atoms = []  # (karakter, emoji_mi, genişlik)
+    for ch in text:
+        em = bool(EMOJI_RE.match(ch))
+        atoms.append((ch, em, (efont if em else font).getlength(ch)))
+
+    lines, cur, cw, brk = [], [], 0.0, 0
+    for a in atoms:
+        cur.append(a)
+        cw += a[2]
+        if a[0] == " ":
+            brk = len(cur)
+            continue
+        if cw > max_w and len(cur) > 1:
+            if brk:
+                line, cur = cur[:brk], cur[brk:]
+            else:
+                line, cur = cur[:-1], cur[-1:]
+            lines.append(line)
+            cw, brk = sum(x[2] for x in cur), 0
+    lines.append(cur)
+    lines = [[a for a in ln] for ln in lines]
+    for ln in lines:
+        while ln and ln[-1][0] == " ":
+            ln.pop()
+
+    ascent, descent = font.getmetrics()
+    line_h = ascent + descent + 2
+    width = max(1, math.ceil(max(sum(a[2] for a in ln) for ln in lines)))
+    img = Image.new("RGBA", (width, line_h * len(lines)), TEXT_RGB + (0,))
+    d = ImageDraw.Draw(img)
+    for i, ln in enumerate(lines):
+        x, base = 0.0, i * line_h + ascent
+        for ch, em, w in ln:
+            if ch != " ":
+                if em:
+                    d.text((x, base), ch, font=efont, embedded_color=True, anchor="ls")
+                else:
+                    d.text((x, base), ch, font=font, fill=TEXT_RGB + (255,), anchor="ls")
+            x += w
+    return img
 
 
 def list_ports():
@@ -51,9 +150,9 @@ def reader(port):
                             break
                         line, buf = buf[:idx], buf[idx + 1:]
                         if line.strip():
-                            messages.put(line.decode("utf-8", "replace").strip())
+                            messages.put(decode(line))
                 elif buf and now - last > FLUSH_AFTER:
-                    messages.put(buf.decode("utf-8", "replace").strip())
+                    messages.put(decode(buf))
                     buf = b""
         except (serial.SerialException, OSError):
             print("Bağlantı koptu, bekleniyor...")
@@ -70,12 +169,81 @@ def click_through(root):
     ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | flags)
 
 
+class Bubble:
+    """Tek bir mesaj balonu: kendi penceresi, kendi solma animasyonu var."""
+
+    def __init__(self, root, text, fonts, scale, now):
+        self.pad = round(20 * scale)
+        img = render_text(text, fonts, round(MAX_TEXT_W * scale))
+        self.w = img.width + 2 * self.pad
+        self.h = img.height + 2 * self.pad
+        self.born = now
+        self.die_at = now + FADE_IN + SHOW_SECONDS
+        self.y = None
+        self.target = 0.0
+        self.alpha = -1.0
+        self.shown_y = None
+        self.scale = scale
+
+        self.win = win = tk.Toplevel(root)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.configure(bg=KEY)
+        win.attributes("-topmost", True)
+        win.attributes("-transparentcolor", KEY)
+        win.attributes("-alpha", 0.0)
+        canvas = tk.Canvas(win, bg=KEY, highlightthickness=0, bd=0, width=self.w, height=self.h)
+        canvas.pack()
+        r = min(self.h // 2, round(30 * scale))
+        x1, y1, x2, y2 = 1, 1, self.w - 1, self.h - 1
+        pts = [x1+r, y1, x2-r, y1, x2, y1, x2, y1+r, x2, y2-r, x2, y2,
+               x2-r, y2, x1+r, y2, x1, y2, x1, y2-r, x1, y1+r, x1, y1]
+        canvas.create_polygon(pts, smooth=True, fill=BUBBLE_FILL, outline=BUBBLE_EDGE, width=2)
+        self.photo = ImageTk.PhotoImage(img, master=win)  # referansı tut, yoksa silinir
+        canvas.create_image(self.pad, self.pad, image=self.photo, anchor="nw")
+        self.x = (win.winfo_screenwidth() - self.w) // 2
+        win.update_idletasks()
+
+    def update(self, now, dt):
+        if self.y is None:  # ilk karede hedefin biraz üstünden kayarak gelsin
+            self.y = self.target - 22 * self.scale
+        self.y += (self.target - self.y) * (1 - math.exp(-dt * 14))
+
+        fade_in = min(1.0, (now - self.born) / FADE_IN)
+        fade_in = 1 - (1 - fade_in) ** 3
+        fade_out = 1 - min(1.0, max(0.0, (now - self.die_at) / FADE_OUT))
+        alpha = round(MAX_ALPHA * fade_in * fade_out, 2)
+
+        y = round(self.y)
+        if y != self.shown_y:
+            self.win.geometry(f"{self.w}x{self.h}+{self.x}+{y}")
+            if self.shown_y is None:
+                self.win.deiconify()
+                self.win.attributes("-topmost", True)
+                click_through(self.win)
+            self.shown_y = y
+        if alpha != self.alpha:
+            self.win.attributes("-alpha", alpha)
+            self.alpha = alpha
+
+    def expired(self, now):
+        return now >= self.die_at + FADE_OUT
+
+    def destroy(self):
+        self.win.destroy()
+
+
 def main():
+    global ENCODING
     ap = argparse.ArgumentParser()
     ap.add_argument("port", nargs="?")
     ap.add_argument("--list", action="store_true")
-    ap.add_argument("--test", metavar="MESAJ")
+    ap.add_argument("--test", metavar="MESAJ", action="append",
+                    help="Bluetooth olmadan dene (birden fazla kez verilebilir)")
+    ap.add_argument("--encoding", default="auto",
+                    help="gelen metnin kodlaması: auto (varsayılan), utf-8, cp1254, iso-8859-9 ...")
     args = ap.parse_args()
+    ENCODING = args.encoding
 
     if args.list:
         list_ports()
@@ -86,55 +254,41 @@ def main():
     except Exception:
         pass
 
-    KEY = "#010101"  # bu renk tamamen şeffaf olur
     root = tk.Tk()
-    root.overrideredirect(True)
-    root.attributes("-topmost", True)
-    root.attributes("-transparentcolor", KEY)
-    root.attributes("-alpha", 0.72)
-    root.configure(bg=KEY)
-    canvas = tk.Canvas(root, bg=KEY, highlightthickness=0, bd=0)
-    canvas.pack()
     root.withdraw()
-    state = {"hide_at": 0.0}
+    dpi = root.winfo_fpixels("1i")
+    scale = dpi / 96
+    fonts = make_fonts(round(TEXT_PT * dpi / 72))
+    bubbles = []
+    clock = {"last": time.monotonic()}
 
-    def rounded(x1, y1, x2, y2, r, **kw):
-        pts = [x1+r, y1, x2-r, y1, x2, y1, x2, y1+r, x2, y2-r, x2, y2,
-               x2-r, y2, x1+r, y2, x1, y2, x1, y2-r, x1, y1+r, x1, y1]
-        return canvas.create_polygon(pts, smooth=True, **kw)
+    def add(text, now):
+        bubbles.append(Bubble(root, text, fonts, scale, now))
+        alive = [b for b in bubbles if now < b.die_at]
+        for b in alive[:-MAX_VISIBLE]:  # fazla balonları en eskiden başlayıp erit
+            b.die_at = now
 
-    def show(text):
-        canvas.delete("all")
-        pad = 20
-        t = canvas.create_text(pad, pad, text=text, anchor="nw", fill="#39ff6a",
-                               font=("Segoe UI", 13, "bold"), width=320)
-        x1, y1, x2, y2 = canvas.bbox(t)
-        w, h = x2 + pad, y2 + pad
-        bubble = rounded(1, 1, w - 1, h - 1, min(h // 2, 30), fill="#0b130e", outline="#2fd45a")
-        canvas.tag_lower(bubble)
-        canvas.config(width=w, height=h)
-        root.update_idletasks()
-        x = (root.winfo_screenwidth() - w) // 2
-        root.geometry(f"{w}x{h}+{x}+110")
-        root.deiconify()
-        root.lift()
-        root.attributes("-topmost", True)
-        click_through(root)
-        state["hide_at"] = time.time() + SHOW_SECONDS
-
-    def poll():
+    def tick():
+        now = time.monotonic()
+        dt = min(now - clock["last"], 0.1)
+        clock["last"] = now
         try:
             while True:
-                show(messages.get_nowait())
+                add(messages.get_nowait(), now)
         except queue.Empty:
             pass
-        if state["hide_at"] and time.time() >= state["hide_at"]:
-            root.withdraw()
-            state["hide_at"] = 0.0
-        root.after(100, poll)
+        for b in [b for b in bubbles if b.expired(now)]:
+            b.destroy()
+            bubbles.remove(b)
+        y = TOP * scale
+        for b in bubbles:
+            b.target = y
+            b.update(now, dt)
+            y += b.h + GAP * scale
+        root.after(16 if bubbles else 100, tick)
 
-    if args.test:
-        messages.put(args.test)
+    for t in args.test or []:
+        messages.put(t)
     if args.port:
         ports = [args.port]
     else:
@@ -145,7 +299,7 @@ def main():
         ports = [p.device for p in (incoming or bt)]
     for port in ports:
         threading.Thread(target=reader, args=(port,), daemon=True).start()
-    poll()
+    tick()
     root.mainloop()
 
 
